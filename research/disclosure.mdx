@@ -1,0 +1,41 @@
+---
+title: "RedSun: Public Disclosure, License, and Affected Scope"
+description: "Disclosure details for RedSun — repository, MIT license, affected Windows versions, CVE status, and the reasoning behind a full source release."
+---
+
+RedSun is a publicly disclosed local privilege escalation proof-of-concept targeting Windows Defender's cloud-delivered protection feature. The author, GitHub user [Nightmare-Eclipse](https://github.com/Nightmare-Eclipse/RedSun), released the full source code alongside a detailed written explanation — a deliberate choice driven by the unusual nature of the flaw itself.
+
+## Release and repository
+
+The PoC was published at [https://github.com/Nightmare-Eclipse/RedSun](https://github.com/Nightmare-Eclipse/RedSun) under the **MIT License**, making the source freely available for research and study. Rather than a silent binary drop, the author provided a complete written explanation of the exploitation chain, citing the flaw's comedic character as the reason:
+
+> "Now, normally I would just drop the PoC code and let people figure it out. But I can't for this one, it's way too funny."
+
+The README summarises the core issue in plain terms: when Windows Defender identifies a file tagged for cloud restoration, it rewrites that file back to its original location — a behavior the PoC turns against the system to overwrite files in `C:\Windows\System32`.
+
+The provider name `SERIOUSLYMSFT` hardcoded into the Cloud Files API sync-root registration (`RedSun.cpp:454`) is accompanied by the inline comment: _"let's see how long you can play this game, I'm willing to go as far as you want."_ This reflects the author's view of Microsoft's responsiveness to the class of vulnerability.
+
+## Affected product and OS versions
+
+<CardGroup cols={2}>
+  <Card title="Affected product" icon="shield">
+    Microsoft Defender Antivirus (Windows Defender) with **cloud-delivered protection** enabled. The vulnerability is in the cloud-restoration logic, not the core antivirus engine.
+  </Card>
+  <Card title="Affected OS versions" icon="windows">
+    Windows 10 and Windows 11, any version where cloud protection and Volume Shadow Copy Service (VSS) are both available and active.
+  </Card>
+</CardGroup>
+
+## CVE and patch status
+
+No CVE number is referenced anywhere in the repository. Researchers should consult [Microsoft's Security Response Center (MSRC)](https://msrc.microsoft.com) directly to determine whether a patch has been issued and under what advisory number. Engine and platform updates for Microsoft Defender Antivirus are delivered independently of Windows cumulative updates, so checking the installed Defender platform version against current MSRC guidance is the most reliable approach.
+
+<Info>
+  The absence of a CVE in the repository does not mean the issue is unpatched. MSRC may have addressed it silently through a Defender engine or signature update without issuing a standalone security advisory.
+</Info>
+
+## Responsible disclosure
+
+<Note>
+  If you discover a vulnerability similar to RedSun — or any security issue in a Microsoft product — consider reporting it through the [Microsoft Security Response Center](https://msrc.microsoft.com/create-report) before publishing a PoC. Coordinated disclosure gives vendors time to protect users while still ensuring the research reaches the community.
+</Note>

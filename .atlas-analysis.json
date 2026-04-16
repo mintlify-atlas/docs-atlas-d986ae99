@@ -1,0 +1,62 @@
+{
+  "projectType": "general",
+  "projectName": "RedSun",
+  "projectDescription": "A Windows security vulnerability proof-of-concept that abuses Windows Defender's cloud-tag file rewriting behavior to overwrite system files and escalate privileges to SYSTEM.",
+  "theme": "aspen",
+  "primaryColor": "#CC2200",
+  "lightColor": null,
+  "darkColor": null,
+  "navigation": {
+    "groups": [
+      {
+        "group": "Overview",
+        "pages": ["introduction", "how-it-works"]
+      },
+      {
+        "group": "Technical Deep Dive",
+        "pages": [
+          "technical/vulnerability",
+          "technical/exploit-chain",
+          "technical/cloud-files-api",
+          "technical/oplock-abuse"
+        ]
+      },
+      {
+        "group": "Building & Running",
+        "pages": [
+          "usage/prerequisites",
+          "usage/building",
+          "usage/running"
+        ]
+      },
+      {
+        "group": "Research",
+        "pages": [
+          "research/disclosure",
+          "research/mitigations",
+          "research/faq"
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Abuses Windows Defender cloud-tag file restoration behavior",
+    "Uses Cloud Files API (CldApi) to create placeholder files with cloud sync tags",
+    "Leverages Volume Shadow Copy service for TOCTOU race condition",
+    "Exploits batch oplock (FSCTL_REQUEST_BATCH_OPLOCK) for precise timing control",
+    "Sets directory reparse point to redirect writes to System32",
+    "Achieves arbitrary write to C:\\Windows\\System32 as a low-privilege user",
+    "Escalates to SYSTEM by replacing TieringEngineService.exe and triggering COM instantiation",
+    "Named pipe trick to spawn console in the original user session after privilege escalation"
+  ],
+  "publicApiSurface": [
+    "main() — entry point; orchestrates the full exploit chain",
+    "ShadowCopyFinderThread() — monitors object manager directory for new VSS volumes",
+    "DoCloudStuff() — registers Cloud Files sync root and creates placeholder with cloud tag",
+    "RetrieveCurrentVSSList() — enumerates existing HarddiskVolumeShadowCopy devices via NtQueryDirectoryObject",
+    "LaunchTierManagementEng() — triggers COM instantiation of StorageTier engine (GUID 50d185b9-...)",
+    "LaunchConsoleInSessionId() — spawns conhost.exe in the original user session via named pipe session ID lookup",
+    "IsRunningAsLocalSystem() — checks if current token is NT AUTHORITY\\SYSTEM and spawns console if so",
+    "rev() — reverses the EICAR test string to evade static detection at compile time"
+  ]
+}

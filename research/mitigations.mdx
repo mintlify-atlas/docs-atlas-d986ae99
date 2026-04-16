@@ -1,0 +1,59 @@
+---
+title: "RedSun LPE: Defender mitigations and detection guidance"
+description: "Blue-team guidance for RedSun: controls to block exploitation and a detection table covering named pipes, reparse points, VSS access, and COM activation."
+---
+
+RedSun exploits a sequence of specific, observable behaviors — Cloud Files API registration, oplock racing, Volume Shadow Copy access, directory reparse point manipulation, and COM activation. Each step in that chain creates a detection opportunity, and several of the preconditions can be broken outright. The guidance below is organized for defenders who want to prevent exploitation and for detection engineers building alerting rules.
+
+## Mitigations
+
+The following controls reduce or eliminate the attack surface. They are ordered from most targeted (least operational impact) to broadest.
+
+<CardGroup cols={2}>
+  <Card title="Apply Defender updates" icon="arrow-up-circle">
+    Install the latest Microsoft Defender Antivirus engine and platform updates from Windows Update or MSRC. Microsoft may have modified the cloud-restoration logic that RedSun abuses. Keeping the Defender platform version current is the lowest-friction mitigation.
+  </Card>
+  <Card title="Disable cloud-delivered protection" icon="cloud-off">
+    Turning off cloud-delivered protection removes the trigger entirely — Defender will not attempt cloud-based file restoration, so the oplock race cannot be entered. This reduces overall protection quality and should be weighed against the environment's risk profile.
+  </Card>
+  <Card title="Alert on System32 writes" icon="file-warning">
+    Alert on any write to `C:\Windows\System32\` from a process whose token is neither `NT AUTHORITY\SYSTEM` nor `NT AUTHORITY\TrustedInstaller`. Legitimate software updates to System32 use Windows Update or trusted installers; ad-hoc writes from user-mode processes are highly anomalous.
+  </Card>
+  <Card title="Monitor VSS device access" icon="database">
+    Unexpected user-mode access to `\\Device\HarddiskVolumeShadowCopy*` devices — particularly `NtOpenDirectoryObject` / `NtQueryDirectoryObject` calls against `\Device` — from processes other than known backup agents is suspicious and should be investigated.
+  </Card>
+  <Card title="Monitor CfRegisterSyncRoot calls" icon="plug">
+    Watch for `CfRegisterSyncRoot` calls from processes that are not known Cloud Files sync clients (OneDrive, Dropbox, Box, etc.). RedSun registers a sync root with the provider name `SERIOUSLYMSFT`, which is trivially detectable by the provider name string alone.
+  </Card>
+  <Card title="Restrict oplock usage" icon="lock">
+    Batch oplocks (`FSCTL_REQUEST_BATCH_OPLOCK`) on VSS shadow copy files from user-mode processes outside of known backup software are uncommon. EDR policies that log or block `DeviceIoControl` with `FSCTL_REQUEST_BATCH_OPLOCK` on shadow volumes provide an additional layer of visibility.
+  </Card>
+</CardGroup>
+
+<Warning>
+  Disabling cloud-delivered protection weakens Windows Defender's ability to detect novel malware. Only apply this mitigation if your environment has compensating controls or if the LPE risk outweighs the reduced detection capability.
+</Warning>
+
+## Detection
+
+The table below lists concrete indicators of compromise (IOCs) derived directly from the RedSun source code. Each maps to a specific line or behavior in `RedSun.cpp`.
+
+| IOC | Type | Description |
+|-----|------|-------------|
+| `\\?\pipe\REDSUN` | Named pipe | Created at startup (`RedSun.cpp:591`). Highly specific; no legitimate software uses this pipe name. |
+| `%TEMP%\RS-{GUID}\` | Directory pattern | Working directory created under `%TEMP%` with the prefix `RS-` followed by a GUID (`RedSun.cpp:596-602`). |
+| `%TEMP%\RS-{GUID}\TieringEngineService.exe` | File creation | The EICAR-containing decoy file written by the PoC before cloud-tag registration (`RedSun.cpp:615-624`). |
+| Process: `TieringEngineService.exe` from `%TEMP%` | Process launch | Legitimate `TieringEngineService.exe` lives in `System32`; spawning from `%TEMP%` is malicious. |
+| `SetReparsePoint` on user-writable dir → `C:\Windows\System32` | Reparse point | The working directory is converted to a mount-point junction targeting `System32` (`RedSun.cpp:713-728`). |
+| `CoCreateInstance` of `{50d185b9-fff3-4656-92c7-e4018da4361d}` | COM activation | Used to trigger execution of the replaced `TieringEngineService.exe` as SYSTEM (`RedSun.cpp:581-587`). |
+| `FILE_SUPERSEDE` on `C:\Windows\System32\TieringEngineService.exe` | File write | Final write that installs the PoC binary as the storage tiering engine (`RedSun.cpp:748`). |
+| Cloud sync root provider name `SERIOUSLYMSFT` | Cloud Files API | Registered via `CfRegisterSyncRoot` (`RedSun.cpp:454`); no legitimate sync client uses this provider name. |
+| EICAR string written to `%TEMP%` | File content | Written reversed then un-reversed at runtime (`RedSun.cpp:621-624`) to trigger Defender's real-time scan. |
+
+<Tip>
+  The named pipe `\\?\pipe\REDSUN` and the provider name `SERIOUSLYMSFT` are both high-confidence, low-noise indicators. Either one appearing in a production environment warrants immediate investigation regardless of other context.
+</Tip>
+
+<Info>
+  Because the EICAR string is written to disk (however briefly), endpoint detection tools that hash or log newly created files in `%TEMP%` will capture it. Correlating that event with a subsequent `SetReparsePoint` call on the same directory is a strong signal of this specific exploit chain.
+</Info>

@@ -1,0 +1,46 @@
+---
+title: "RedSun: Windows Defender LPE vulnerability explained"
+description: "RedSun is a Windows Defender privilege escalation PoC that turns antivirus cloud-file restoration into a SYSTEM-level arbitrary write primitive."
+---
+
+RedSun is a proof-of-concept exploit that exposes an unexpected privilege escalation path in Windows Defender. By abusing the way Defender handles cloud-tagged files it identifies as malicious, a low-privilege user can coerce the antivirus engine into writing an arbitrary file directly into `C:\Windows\System32` — no administrator rights required.
+
+<Warning>
+  RedSun is a security research proof-of-concept. Running it on systems you do not own or without explicit authorization is illegal. This documentation exists for educational and defensive research purposes only.
+</Warning>
+
+## The surprising root behavior
+
+When Windows Defender detects a malicious file that also carries a cloud placeholder tag (a Cloud Files API sync marker), it does not delete or quarantine the file in the usual sense. Instead, it rewrites the file back to its original location. The README captures this well:
+
+> "I think antimalware products are supposed to remove malicious files not be sure they are there but that's just me."
+
+This rewrite is performed by the Defender service, which runs as `NT AUTHORITY\SYSTEM`. RedSun arranges for that rewrite to land somewhere the attacker chooses — specifically, `System32\TieringEngineService.exe` — rather than the file's legitimate path.
+
+## Impact
+
+A standard low-privilege user account can:
+
+1. Write the EICAR test string into a temporary working directory.
+2. Trigger Defender's cloud-file restoration logic.
+3. Redirect the resulting `SYSTEM`-level file write into `C:\Windows\System32`.
+4. Replace `TieringEngineService.exe` with a copy of their own executable.
+5. Invoke the Storage Tiers Management COM server, which launches the replaced binary as `SYSTEM`.
+6. Spawn an interactive `conhost.exe` in the original user's session — giving a fully interactive `SYSTEM` shell.
+
+<Note>
+  The exploit requires Windows Defender real-time protection to be active. If the PoC times out (120-second window), Defender may not be scanning in real time.
+</Note>
+
+## Responsible disclosure
+
+This vulnerability has been documented and released as a public proof of concept. If you are a defender or incident responder, the [How RedSun works](/how-it-works) page provides a complete technical breakdown of every stage in the exploit chain — including the specific Windows APIs involved — to support detection and mitigation efforts.
+
+<CardGroup cols={2}>
+  <Card title="How RedSun works" icon="gears" href="/how-it-works">
+    A step-by-step walkthrough of the full exploit chain, including source code references and the key Windows APIs abused.
+  </Card>
+  <Card title="Source code" icon="code" href="https://github.com/Nightmare-Eclipse/RedSun">
+    The full PoC source on GitHub.
+  </Card>
+</CardGroup>

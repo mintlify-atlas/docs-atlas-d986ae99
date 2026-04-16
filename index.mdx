@@ -1,97 +1,56 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "RedSun: Windows Defender LPE — exploit documentation"
+description: "RedSun is a proof-of-concept exploit that abuses Windows Defender's cloud-tag file restoration behavior to overwrite System32 files and escalate to SYSTEM."
 ---
 
-## Setting up
+RedSun is a security research proof-of-concept that exposes a logic flaw in Windows Defender: when the antivirus detects a file bearing a cloud sync tag, it rewrites that file back to disk rather than removing it. This PoC weaponizes that behavior through a chain of Windows internals primitives — oplocks, Volume Shadow Copies, the Cloud Files API, and directory reparse points — to achieve an arbitrary write to `C:\Windows\System32` from a low-privilege user account, ultimately replacing `TieringEngineService.exe` and escalating to `NT AUTHORITY\SYSTEM`.
 
-Get your documentation site up and running in minutes.
+<Warning>
+  RedSun is published for educational and defensive security research purposes only. Running this exploit against systems you do not own or have explicit permission to test is illegal and unethical. Understand your local laws before proceeding.
+</Warning>
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="How it works" icon="diagram-project" href="/how-it-works">
+    A plain-English walkthrough of the full exploit chain from EICAR write to SYSTEM shell.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Vulnerability details" icon="bug" href="/technical/vulnerability">
+    The root-cause flaw in Windows Defender's cloud-tag restoration logic.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Build & run" icon="hammer" href="/usage/prerequisites">
+    Prerequisites, build instructions, and how to execute the PoC safely.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Mitigations" icon="shield-halved" href="/research/mitigations">
+    Defensive measures and detection opportunities for blue teams.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## The exploit at a glance
 
-Everything you need to create world-class documentation.
+<Steps>
+  <Step title="Write EICAR and tag the file">
+    The PoC writes the standard EICAR antivirus test string to a temporary file and opens it with `FILE_EXECUTE` access to trigger Defender's real-time scan. Once Defender responds, the Cloud Files API is used to attach a cloud-sync placeholder tag (`CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC`) to the file — making Defender treat it as a cloud-backed object to restore rather than delete.
+  </Step>
+  <Step title="Race Windows Defender with an oplock">
+    A batch oplock (`FSCTL_REQUEST_BATCH_OPLOCK`) is acquired on the file inside a Volume Shadow Copy. When Defender triggers its restoration pass, the oplock fires — giving the PoC precise control over the race window.
+  </Step>
+  <Step title="Redirect the write to System32">
+    During the oplock window, the working directory is replaced with a mount-point reparse point targeting `C:\Windows\System32`. Defender's file restoration write lands in System32 instead of the temp directory.
+  </Step>
+  <Step title="Escalate to SYSTEM">
+    `TieringEngineService.exe` in System32 is now replaced with the PoC binary. Triggering the Storage Tiering COM object causes the service to launch the payload as `NT AUTHORITY\SYSTEM`. A named pipe trick spawns `conhost.exe` back in the original user session.
+  </Step>
+</Steps>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Key technical primitives
 
-## Need inspiration?
+| Primitive | Purpose |
+|-----------|---------|
+| Cloud Files API (`CldApi.lib`) | Tags the bait file as a cloud placeholder to trigger Defender's restoration logic |
+| Batch oplock (`FSCTL_REQUEST_BATCH_OPLOCK`) | Pauses Defender's write at precisely the right moment |
+| Volume Shadow Copy detection | Identifies the VSS volume Defender uses to source the restoration copy |
+| Directory reparse point | Redirects Defender's write from `%TEMP%` to `System32` |
+| COM activation (GUID `50d185b9-...`) | Triggers `TieringEngineService.exe` execution as SYSTEM |
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Info>
+  The vulnerability was first publicly described in the [RedSun README](https://github.com/Nightmare-Eclipse/RedSun). The author notes: *"I think antimalware products are supposed to remove malicious files not be sure they are there but that's just me."*
+</Info>

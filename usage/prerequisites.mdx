@@ -1,0 +1,73 @@
+---
+title: "RedSun prerequisites: system and build requirements"
+description: "System and environment requirements before you build or run the RedSun PoC, including Defender configuration, SDK versions, and architecture constraints."
+---
+
+Before you attempt to build or execute RedSun, verify that every requirement below is satisfied. The exploit depends on a precise interaction between Windows Defender's cloud remediation path and the Cloud Files API — missing any single requirement will prevent the PoC from working or will cause it to time out.
+
+<Warning>
+  RedSun is a proof-of-concept exploit that overwrites a protected system binary and spawns a shell as `NT AUTHORITY\SYSTEM`. Only run it on machines you own and have explicit authorization to test on. Restore the system with `sfc /scannow` after every test run.
+</Warning>
+
+## Target system requirements
+
+The machine on which you run RedSun.exe must meet all of the following conditions:
+
+<Info>
+  Both real-time protection **and** cloud-delivered protection must be active simultaneously. Disabling either one will cause the PoC to fall through to the 120-second timeout. There is no supported path through the exploit without Defender's cloud remediation response.
+</Info>
+
+- **Operating system**: Windows 10 or Windows 11 (64-bit). The exploit targets `TieringEngineService.exe` in `C:\Windows\System32` and uses Windows internals that are 64-bit specific.
+- **Windows Defender — real-time protection**: must be **enabled**. Defender must be actively scanning file I/O so it picks up the EICAR string written to the working directory.
+- **Windows Defender — cloud-delivered protection**: must be **enabled**. The vulnerability lives specifically in Defender's cloud remediation path: when Defender identifies a cloud-tagged file as malicious, it rewrites the file to its original location. RedSun abuses that rewrite to pivot control of the file restoration.
+- **No third-party AV**: third-party antivirus products do not exercise the same cloud remediation code path and will not trigger the vulnerability. If another AV product is the primary engine, the PoC will not work.
+
+<Note>
+  The EICAR test string is written in reversed form in the source and reversed at runtime (`rev(eicar)` at `RedSun.cpp:622`). Some third-party AV products may still detect the reversed string or the final binary and block the process entirely before Defender has a chance to respond.
+</Note>
+
+## Build environment requirements
+
+You need an MSVC toolchain. GCC, Clang, and MinGW are not supported because the code uses MSVC-specific pragmas, Windows SDK headers, and the Cloud Files API (`cfapi.h`).
+
+| Requirement | Minimum version |
+|---|---|
+| Visual Studio | 2019 (16.x) or 2022 (17.x) |
+| Workload | Desktop development with C++ |
+| Windows SDK | 10.0.17763.0 (October 2018 Update) or later |
+| Target platform | x64 |
+| Configuration | Release |
+
+The four libraries pulled in via `#pragma comment` in the source must be present in your SDK installation:
+
+```cpp
+#pragma comment(lib,"synchronization.lib")
+#pragma comment(lib,"sas.lib")
+#pragma comment(lib,"ntdll.lib")
+#pragma comment(lib,"CldApi.lib")
+```
+
+`CldApi.lib` ships with the Windows 10 SDK starting at version 10.0.17763.0. If your SDK predates that version, `cfapi.h` will be missing and the build will fail.
+
+## Architecture
+
+The exploit must be compiled and run as **x64**. The code uses Windows internal structures (`UNICODE_STRING`, NT native APIs, `NtCreateFile` with `FILE_SUPERSEDE`) and makes assumptions about pointer sizes and struct layouts that are only valid on a 64-bit target.
+
+## User account requirements
+
+<Warning>
+  Run RedSun.exe as a **standard (non-administrator) user**. The entire point of the exploit is to escalate from a standard user to `NT AUTHORITY\SYSTEM`. If you launch it from an elevated prompt, the privilege escalation has already happened and the exploit's final stage — spawning a SYSTEM-level `conhost.exe` — will not demonstrate the intended impact.
+</Warning>
+
+## Checklist
+
+Before proceeding to [Building](/usage/building), confirm each item:
+
+- [ ] Windows 10 or Windows 11 x64 target machine
+- [ ] Windows Defender real-time protection is **on**
+- [ ] Windows Defender cloud-delivered protection is **on**
+- [ ] No third-party antivirus is active as the primary engine
+- [ ] Visual Studio 2019 or 2022 installed with Desktop C++ workload
+- [ ] Windows SDK 10.0.17763.0 or later installed
+- [ ] Build target set to x64 / Release
+- [ ] You will run the compiled binary as a standard user, not as administrator

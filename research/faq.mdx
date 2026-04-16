@@ -1,0 +1,74 @@
+---
+title: "Frequently asked questions — RedSun Windows Defender LPE"
+description: "Common questions about RedSun: affected versions, EICAR usage, reversed strings, privilege requirements, and how to recover the overwritten system binary."
+---
+
+The following questions cover the most common points of confusion about how RedSun works, what it targets, and how to recover from it. Answers draw directly from the source code in `RedSun.cpp` and the accompanying README.
+
+<AccordionGroup>
+  <Accordion title="Does this work on the latest Windows?">
+    RedSun was demonstrated on Windows 10 and Windows 11. Whether it still works depends on whether Microsoft has patched the cloud-restoration logic in Defender's engine since the PoC was published. The fix, if any, would arrive as a Defender engine or platform update rather than a Windows cumulative update.
+
+    Check the installed Defender platform version against current guidance at [Microsoft's MSRC](https://msrc.microsoft.com). There is no CVE number in the repository to search by, so reviewing the Defender release notes for changes to cloud-file restoration behavior is the most direct approach.
+  </Accordion>
+
+  <Accordion title="Does it work with third-party antivirus installed?">
+    No. The exploit is specific to Windows Defender's cloud-delivered protection restoration path. Third-party antivirus products do not implement the same Cloud Files API-based restoration behavior, so the trigger condition cannot be created.
+
+    There is a secondary consideration: if a third-party AV product detects and removes the EICAR test string before Windows Defender does, Defender never enters the restoration path, and the race never starts. Having a third-party AV effectively prevents the PoC from functioning, though this should not be relied on as a mitigation strategy.
+  </Accordion>
+
+  <Accordion title="Why does it use TieringEngineService.exe specifically?">
+    `TieringEngineService.exe` is the Storage Tiering Management Engine, activated via the COM class identifier `{50d185b9-fff3-4656-92c7-e4018da4361d}` (`RedSun.cpp:581`). The PoC overwrites this binary with a copy of itself (`RedSun.cpp:771`) and then triggers its COM activation (`RedSun.cpp:772`), which causes Windows to launch the replaced binary as `NT AUTHORITY\SYSTEM`.
+
+    The choice is not unique to this binary. Any system executable in `System32` that can be COM-activated or that would be launched by a privileged service could theoretically serve the same purpose. `TieringEngineService.exe` was selected because its COM interface is easily triggered from user mode.
+  </Accordion>
+
+  <Accordion title="What is the EICAR test string used for?">
+    The EICAR Anti-Malware Test File string is a standardized, benign byte sequence that all compliant antivirus products are required to detect as a test virus. It was created by the European Institute for Computer Antivirus Research (EICAR) for exactly this purpose — verifying that an AV scanner is functional without using real malware.
+
+    RedSun writes the EICAR string to `%TEMP%\RS-{GUID}\TieringEngineService.exe` (`RedSun.cpp:621-624`) to trigger Windows Defender's real-time scanner. When Defender detects it, Defender's cloud-delivered protection marks the file for cloud-based restoration — and it is that restoration write that the PoC then hijacks.
+  </Accordion>
+
+  <Accordion title="Why is the EICAR string stored reversed in the source code?">
+    The EICAR string `X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*` is stored in the source as its mirror image:
+
+    ```text
+    *H+H$!ELIF-TSET-SURIVITNA-DRADNATS-RACIE$}7)CC7)^P(45XZP\4[PA@%P!O5X
+    ```
+
+    This prevents antivirus engines from flagging the RedSun executable itself when it sits on disk at rest. The `rev()` function (`RedSun.cpp:427-446`) reverses the string in memory at runtime before it is written to the decoy file, so the live string only ever exists in the process's memory and as a disk write — not as a static string inside the binary.
+  </Accordion>
+
+  <Accordion title="What privilege level is required to run the PoC?">
+    A standard, non-elevated user account. The entire purpose of the exploit is to escalate from a standard user to `NT AUTHORITY\SYSTEM`. Running RedSun from an already-elevated or SYSTEM context defeats the point.
+
+    The PoC includes an early check (`IsRunningAsLocalSystem`, `RedSun.cpp:555-575`): if it detects that it is already running as SYSTEM — which happens on the second execution after the TieringEngineService replacement — it launches a console window in the original user's session and exits, rather than looping.
+  </Accordion>
+
+  <Accordion title="Will running sfc /scannow restore the system?">
+    Yes. Running System File Checker as an administrator from an elevated command prompt will restore the original `TieringEngineService.exe` from the Windows component store:
+
+    ```powershell
+    sfc /scannow
+    ```
+
+    This should be run from an elevated command prompt or PowerShell session. SFC compares protected system files against the component store (`C:\Windows\WinSxS`) and replaces any that differ. If the component store itself is intact, the legitimate binary will be restored.
+
+    <Tip>
+      After running `sfc /scannow`, verify the repair with `DISM /Online /Cleanup-Image /CheckHealth` to confirm the component store is healthy.
+    </Tip>
+  </Accordion>
+
+  <Accordion title='What does "The sun is shinning" mean in the output?'>
+    This is a status message printed at `RedSun.cpp:397`:
+
+    ```cpp
+    printf("The sun is shinning...\n");
+    ```
+
+    It is printed by the `ShadowCopyFinderThread` immediately after it successfully opens the target file on a newly created Volume Shadow Copy. At that point the thread requests a batch oplock (`FSCTL_REQUEST_BATCH_OPLOCK`) on the VSS copy of `TieringEngineService.exe`. The message signals that Defender has triggered its restoration process and that the oplock — which will break when Defender tries to read the file — is now in place. When the oplock breaks, the race window opens and the main thread proceeds to set up the directory reparse point.
+
+    The message "The red sun shall prevail." (`RedSun.cpp:760`) is printed when the final `NtCreateFile` with `FILE_SUPERSEDE` on `C:\Windows\System32\TieringEngineService.exe` succeeds, confirming the overwrite.
+  </Accordion>
+</AccordionGroup>

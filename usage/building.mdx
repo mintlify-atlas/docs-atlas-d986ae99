@@ -1,0 +1,95 @@
+---
+title: "Building RedSun from source using Visual Studio MSVC"
+description: "Step-by-step instructions to compile RedSun.cpp into a release x64 binary using Visual Studio 2019 or 2022 and the Windows 10 SDK."
+---
+
+RedSun ships as a single translation unit — `RedSun.cpp` — with no build system, no CMake file, and no solution file in the repository. All library dependencies are declared directly in the source via `#pragma comment(lib, ...)`, so the MSVC linker picks them up automatically once you point the project at the right Windows SDK version.
+
+<Warning>
+  The compiled binary contains a live EICAR test string that is reconstructed at runtime. Windows Defender on your **build machine** may flag `RedSun.exe` immediately after compilation and quarantine or delete the output file. If that happens, temporarily add the output folder (`x64\Release\`) to Defender's exclusion list before building — and remove the exclusion as soon as you are done.
+</Warning>
+
+<Steps>
+
+  <Step title="Clone the repository">
+    Open a terminal and clone the repository to your build machine:
+
+    ```bash
+    git clone https://github.com/Nightmare-Eclipse/RedSun.git
+    ```
+
+    The repository contains one relevant source file: `RedSun.cpp`.
+  </Step>
+
+  <Step title="Create a Visual Studio project">
+    Open Visual Studio 2019 or 2022 and create a new empty C++ project:
+
+    1. Go to **File → New → Project**.
+    2. Select **Empty Project** under the C++ category and click **Next**.
+    3. Name the project `RedSun`, choose a location, and click **Create**.
+    4. In **Solution Explorer**, right-click **Source Files → Add → Existing Item** and select `RedSun.cpp` from the cloned directory.
+
+    <Tip>
+      Alternatively, use **File → New → Project from Existing Code** (available in Visual Studio 2019). Choose **Visual C++** as the project type and point it at the directory containing `RedSun.cpp`.
+    </Tip>
+  </Step>
+
+  <Step title="Configure project properties">
+    Open **Project → Properties** and apply the following settings. Make sure the configuration dropdown at the top is set to **Release** and the platform dropdown is set to **x64** before making changes.
+
+    | Property page | Setting | Value |
+    |---|---|---|
+    | General | Platform Toolset | v142 (VS 2019) or v143 (VS 2022) |
+    | General | Windows SDK Version | 10.0.17763.0 or later |
+    | General | Character Set | Use Unicode Character Set |
+    | C/C++ → General | Additional Include Directories | *(default — SDK include paths are inherited)* |
+    | Linker → System | SubSystem | Console |
+
+    The four libraries required by the source are already declared with `#pragma comment` and do not need to be added to **Additional Dependencies** manually:
+
+    ```cpp
+    #pragma comment(lib,"synchronization.lib")
+    #pragma comment(lib,"sas.lib")
+    #pragma comment(lib,"ntdll.lib")
+    #pragma comment(lib,"CldApi.lib")
+    ```
+
+    `CldApi.lib` ships with Windows SDK 10.0.17763.0 and later. If the linker reports that it cannot find `CldApi.lib`, your SDK is too old — update it via **Visual Studio Installer → Modify → Individual Components → Windows 10 SDK**.
+  </Step>
+
+  <Step title="Verify the SDK provides cfapi.h">
+    `cfapi.h` is the Cloud Files API header used by `DoCloudStuff()`. It is included unconditionally at the top of the source:
+
+    ```cpp
+    #include <cfapi.h>
+    ```
+
+    If the compiler reports `cannot open include file: 'cfapi.h'`, your Windows SDK version is earlier than 10.0.17763.0. Install the correct SDK version and update the **Windows SDK Version** property as described in the previous step.
+  </Step>
+
+  <Step title="Build the solution">
+    With the configuration set to **Release | x64**, build the project:
+
+    - Menu: **Build → Build Solution**
+    - Keyboard shortcut: **Ctrl+Shift+B**
+
+    A successful build produces:
+
+    ```
+    x64\Release\RedSun.exe
+    ```
+
+    The Output window should end with a line similar to:
+
+    ```
+    ========== Build: 1 succeeded, 0 failed, 0 up-to-date, 0 skipped ==========
+    ```
+  </Step>
+
+</Steps>
+
+<Note>
+  A Debug build works but is not recommended for testing. The Release configuration strips debug symbols and applies optimizations that more closely match a real deployment scenario. More importantly, a Debug binary is larger and more likely to be caught by heuristic scanning on the target machine before the exploit reaches the trigger point.
+</Note>
+
+Once `RedSun.exe` is built, proceed to [Running](/usage/running) for expected behavior and output.

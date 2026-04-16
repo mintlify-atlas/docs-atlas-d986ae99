@@ -1,0 +1,116 @@
+---
+title: "Running RedSun: expected output and system restoration"
+description: "How to execute RedSun.exe, what console output to expect at each stage, timeout behavior, and how to restore the system after a successful run."
+---
+
+Running RedSun.exe is silent for most of its execution — the exploit spends the majority of its time waiting for Windows Defender's cloud remediation response. When Defender responds, two short lines of output mark the two critical milestones. A new `conhost.exe` window then appears running as `NT AUTHORITY\SYSTEM`.
+
+<Warning>
+  RedSun overwrites `C:\Windows\System32\TieringEngineService.exe` with a copy of itself as part of the exploit chain. This file is not automatically restored when the process exits. Run `sfc /scannow` from an elevated command prompt after every test to restore the original binary. Leaving a modified system binary in place can cause issues with Storage Tiering and related Windows services.
+</Warning>
+
+## Before you run
+
+Confirm the following before launching the binary:
+
+- Windows Defender real-time protection is **on**.
+- Windows Defender cloud-delivered protection is **on**.
+- You are running from a **standard user** command prompt — not an elevated one. Right-click the shortcut and confirm there is no "Run as administrator" shield on the prompt you are using.
+
+See [Prerequisites](/usage/prerequisites) if you need to verify these settings.
+
+## Launching the PoC
+
+Open a standard (non-elevated) command prompt and run the binary directly:
+
+```batch
+x64\Release\RedSun.exe
+```
+
+The process will appear to hang. This is expected. The exploit is waiting for Defender to detect the EICAR string written to `%TEMP%\RS-{GUID}\TieringEngineService.exe` and initiate its cloud remediation path.
+
+## Expected output sequence
+
+### Stage 1 — Defender triggers the oplock break
+
+```
+The sun is shinning...
+```
+
+This line is printed by `ShadowCopyFinderThread` at `RedSun.cpp:397`, immediately after `NtCreateFile` successfully opens the VSS copy of `TieringEngineService.exe`. At this point the thread requests a batch oplock (`FSCTL_REQUEST_BATCH_OPLOCK`) on that VSS file and signals the main thread to proceed with the Cloud Files API placeholder registration. The oplock will break when Defender opens the VSS copy to read its restoration content.
+
+### Stage 2 — FILE_SUPERSEDE succeeds
+
+```
+The red sun shall prevail.
+```
+
+This line is printed at `RedSun.cpp:760`, after the loop that calls `NtCreateFile` with `FILE_SUPERSEDE` against `C:\Windows\System32\TieringEngineService.exe` completes without error:
+
+```cpp
+stat = NtCreateFile(&hlk, GENERIC_WRITE, &objattr2, &iostat, NULL, NULL,
+    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    FILE_SUPERSEDE, NULL, NULL, NULL);
+if (!stat)
+    break;
+```
+
+At this point, `TieringEngineService.exe` in System32 has been superseded (overwritten) by the PoC binary from a standard user context.
+
+### Stage 3 — SYSTEM shell appears
+
+Shortly after "The red sun shall prevail." is printed, a new **conhost.exe** window opens on the desktop. That window is running as `NT AUTHORITY\SYSTEM`. The PoC achieves this by:
+
+1. Copying itself to `%WINDIR%\System32\TieringEngineService.exe`.
+2. Instantiating the Storage Tiering Engine COM object (GUID `50d185b9-fff3-4656-92c7-e4018da4361d`), which causes the service host to load the replaced binary as `SYSTEM`.
+3. The binary detects it is running as `SYSTEM` via `IsRunningAsLocalSystem()` (`RedSun.cpp:555`), then calls `LaunchConsoleInSessionId()` to spawn `conhost.exe` in the interactive user's session.
+
+## Timeout behavior
+
+If Defender does not respond within 120 seconds, the main thread's `WaitForSingleObject` call at `RedSun.cpp:628` expires and the process prints:
+
+```
+PoC timed out, is real time protection enabled ?
+```
+
+```cpp
+if (WaitForSingleObject(gevent, 120000) != WAIT_OBJECT_0)
+{
+    printf("PoC timed out, is real time protection enabled ?");
+    return 1;
+}
+```
+
+The most common causes for a timeout are:
+
+- Cloud-delivered protection is disabled (real-time protection alone is not sufficient).
+- A third-party AV product is the active engine instead of Windows Defender.
+- The EICAR string was blocked or quarantined before Defender's cloud remediation path was invoked.
+
+<Note>
+  The 120-second window corresponds directly to the `120000` millisecond argument passed to `WaitForSingleObject`. There is no retry or fallback — if the timeout fires, the process exits with code 1 and leaves no modified system files behind.
+</Note>
+
+## Restoring the system after a successful run
+
+A successful run replaces `C:\Windows\System32\TieringEngineService.exe` with the PoC binary. To restore the original:
+
+1. Open an **elevated** command prompt (Run as administrator).
+2. Run Windows System File Checker:
+
+   ```batch
+   sfc /scannow
+   ```
+
+3. Wait for the scan to complete. SFC will detect the corrupted binary and restore it from the Windows component store.
+
+<Tip>
+  If SFC reports that it found corrupt files but was unable to fix some of them, run the DISM repair command first and then re-run SFC:
+
+  ```batch
+  DISM /Online /Cleanup-Image /RestoreHealth
+  sfc /scannow
+  ```
+</Tip>
+
+The `%TEMP%\RS-{GUID}\` working directory and any `.TMP` / `.TEMP2` remnants in `%TEMP%` can be deleted manually after the run.
